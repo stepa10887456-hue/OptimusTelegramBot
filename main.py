@@ -1,12 +1,11 @@
 import logging
 import asyncio
 import os
+import re
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 
 logging.basicConfig(level=logging.INFO)
 
@@ -14,12 +13,10 @@ API_TOKEN = '8509137282:AAFZZmmtw3laqW_HAyY8mlW-gjdapkxJk9M'
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
-# Словарик для хранения связок Юзер:Группа (в идеале сюда нужна БД)
-user_groups = {} 
+# Храним ID группы, куда добавили бота
+# Формат: {id_юзера: id_группы}
+user_groups = {}
 spam_tasks = {}
-
-class OptimusStates(StatesGroup):
-    waiting_for_spam = State()
 
 # --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
 async def handle(request):
@@ -34,98 +31,152 @@ async def start_background_web():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# --- МЕНЮ ---
+# --- МЕНЮ (ТОЛЬКО В ЛС) ---
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/Optimusbylumoxv2_bot?startgroup=true"))
-    builder.row(types.InlineKeyboardButton(text="🚀 Спам-функция", callback_data="spam_setup"))
-    builder.row(types.InlineKeyboardButton(text="🔍 Сканировать группу", callback_data="scan_info"))
+    builder.row(types.InlineKeyboardButton(text="🔍 Сканировать группу", callback_data="scan_now"))
     builder.row(types.InlineKeyboardButton(text="🔗 Получить ссылку", callback_data="get_link"))
+    builder.row(types.InlineKeyboardButton(text="🛑 Стоп спам", callback_data="stop_spam"))
     return builder.as_markup()
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
-    await message.answer("🤖 **Optimus v2.0** запущен.\nУправляй функциями через кнопки ниже:", reply_markup=get_main_menu())
-
-# --- ФУНКЦИЯ СПАМА ---
-@dp.callback_query(F.data == "spam_setup")
-async def spam_setup(callback: types.CallbackQuery, state: FSMContext):
-    await state.set_state(OptimusStates.waiting_for_spam)
-    await callback.message.answer("Введите данные для спама в формате:\n`Кол-во | Текст` (например: `5 | Привет`)")
-    await callback.answer()
-
-@dp.message(OptimusStates.waiting_for_spam)
-async def run_spam(message: types.Message, state: FSMContext):
-    if '|' not in message.text:
-        return await message.answer("❌ Неверный формат! Используй: `Число | Текст`")
+    # Если написали в группе - игнорируем
+    if message.chat.type != 'private':
+        return
     
-    parts = message.text.split('|', 1)
-    count = int(parts[0].strip())
-    text = parts[1].strip()
-    user_id = message.from_user.id
-    
-    # Ищем группу, в которую юзер добавил бота
-    chat_id = user_groups.get(user_id)
-    if not chat_id:
-        return await message.answer("❌ Я не знаю куда спамить! Сначала добавь меня в группу.")
+    await message.answer(
+        "🤖 **Optimus Control Panel**\n\n"
+        "📜 **Инструкция:**\n"
+        "1. Добавь меня в группу админом.\n"
+        "2. Чтобы запустить спам, напиши мне в ЛС:\n"
+        "`!кол-во текст`\n"
+        "Пример: `!5 Привет всем!`\n\n"
+        "👇 Управление:", 
+        reply_markup=get_main_menu()
+    )
 
-    await state.clear()
-    spam_tasks[chat_id] = True
-    await message.answer(f"🚀 Запускаю спам в группу...")
+# --- СПАМ ПО ФОРМАТУ !10 ТЕКСТ ---
+@dp.message(F.text.startswith("!"))
+async def spam_command(message: types.Message):
+    if message.chat.type != 'private': return # Только в личке
 
-    for i in range(count):
-        if chat_id not in spam_tasks: break
-        try:
-            await bot.send_message(chat_id, text)
-            await asyncio.sleep(0.7)
-        except: break
-    
-    await message.answer("✅ Готово!")
+    # Парсим сообщение: ищем число после ! и текст
+    # Пример: !10 Привет
+    try:
+        match = re.match(r'!(\d+)\s+(.+)', message.text)
+        if not match:
+            return await message.answer("❌ Неверный формат!\nПиши так: `!10 Привет`")
+
+        count = int(match.group(1))
+        text = match.group(2)
+        user_id = message.from_user.id
+        
+        # Проверяем, привязан ли бот к группе
+        target_chat_id = user_groups.get(user_id)
+        if not target_chat_id:
+            return await message.answer("❌ Я не знаю, куда писать! Сначала добавь меня в группу.")
+
+        # Запуск
+        spam_tasks[target_chat_id] = True
+        await message.answer(f"🚀 Отправляю '{text}' {count} раз в группу...")
+
+        for i in range(count):
+            if target_chat_id not in spam_tasks: break
+            try:
+                await bot.send_message(target_chat_id, text)
+                await asyncio.sleep(0.8) # Пауза, чтобы не забанили
+            except Exception as e:
+                await message.answer(f"⚠️ Ошибка отправки: {e}")
+                break
+        
+        if target_chat_id in spam_tasks: del spam_tasks[target_chat_id]
+        await message.answer("✅ Спам завершен.")
+
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+
+@dp.callback_query(F.data == "stop_spam")
+async def stop_spam_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    target_chat_id = user_groups.get(user_id)
+    if target_chat_id and target_chat_id in spam_tasks:
+        del spam_tasks[target_chat_id]
+        await callback.answer("🛑 Остановлено!")
+        await callback.message.answer("🛑 Спам принудительно остановлен.")
+    else:
+        await callback.answer("Спам сейчас не идет.")
+
+# --- СКАНИРОВАНИЕ (ПО КНОПКЕ В ЛС) ---
+@dp.callback_query(F.data == "scan_now")
+async def scan_group_remote(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    target_chat_id = user_groups.get(user_id)
+
+    if not target_chat_id:
+        return await callback.message.answer("❌ Группа не найдена. Удалите меня из группы и добавьте снова.")
+
+    try:
+        chat = await bot.get_chat(target_chat_id)
+        admins = await bot.get_chat_administrators(target_chat_id)
+        
+        report = (
+            f"📊 **Анализ группы**\n"
+            f"🏷 Название: {chat.title}\n"
+            f"🆔 ID: `{chat.id}`\n"
+            f"👮 Админов: {len(admins)}\n"
+        )
+        
+        vulns = []
+        if chat.permissions and chat.permissions.can_invite_users:
+            vulns.append("⚠️ Доступен инвайт (обычные юзеры могут звать ботов)")
+        if chat.permissions and chat.permissions.can_pin_messages:
+            vulns.append("⚠️ Открыты закрепы")
+
+        if vulns:
+            report += "\n".join(vulns)
+        else:
+            report += "✅ Критических дыр в правах нет."
+
+        await callback.message.answer(report)
+        await callback.answer()
+        
+    except Exception as e:
+        await callback.message.answer(f"❌ Не могу просканировать. Я еще админ там?\nОшибка: {e}")
 
 # --- ПОЛУЧИТЬ ССЫЛКУ ---
 @dp.callback_query(F.data == "get_link")
-async def get_link_handler(callback: types.CallbackQuery):
+async def get_link_remote(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    chat_id = user_groups.get(user_id)
+    target_chat_id = user_groups.get(user_id)
     
-    if not chat_id:
-        return await callback.message.answer("❌ Нет данных о группе. Добавь меня куда-нибудь!")
+    if not target_chat_id:
+        return await callback.message.answer("❌ Группа не найдена.")
 
     try:
-        link = await bot.export_chat_invite_link(chat_id)
-        await bot.send_message(user_id, f"🔗 Ссылка на вашу группу:\n{link}")
-        await callback.answer("Ссылка отправлена!")
+        link = await bot.export_chat_invite_link(target_chat_id)
+        await callback.message.answer(f"🔗 Ваша ссылка: {link}")
+        await callback.answer()
     except:
-        await callback.message.answer("❌ Не удалось создать ссылку. Проверь, админ ли я в группе.")
+        await callback.message.answer("❌ Ошибка. Дайте мне права 'Управление ссылками' в группе.")
 
-# --- СКАНЕР ---
-@dp.callback_query(F.data == "scan_info")
-async def scan_info(callback: types.CallbackQuery):
-    await callback.message.answer("Просто напиши `/scan` в своей группе, и я пришлю отчет сюда.")
-    await callback.answer()
-
-@dp.message(Command("scan"))
-async def cmd_scan(message: types.Message):
-    if message.chat.type == "private": return
-    
-    user_id = message.from_user.id
-    try:
-        admins = await bot.get_chat_administrators(message.chat.id)
-        report = f"📊 **Отчет: {message.chat.title}**\nАдминов: {len(admins)}\nСтатус: Работает штатно ✅"
-        await bot.send_message(user_id, report)
-        await message.answer("🔍 Результат отправлен в ЛС.")
-    except:
-        await message.answer("Дайте мне права админа!")
-
-# --- ЗАПОМИНАНИЕ ГРУППЫ ---
+# --- АВТО-ПРИВЯЗКА ПРИ ДОБАВЛЕНИИ ---
 @dp.my_chat_member()
 async def on_bot_added(event: types.ChatMemberUpdated):
+    # Реагируем только если бота добавили или повысили права
     if event.new_chat_member.status in ["member", "administrator"]:
-        # Запоминаем, кто добавил бота и в какой чат
-        user_groups[event.from_user.id] = event.chat.id
+        user_id = event.from_user.id
+        chat_id = event.chat.id
+        
+        # Запоминаем связку: Этот Юзер -> Эта Группа
+        user_groups[user_id] = chat_id
+        
+        # Пишем ТОЛЬКО в личку юзеру, в группе молчим
         try:
-            await bot.send_message(event.from_user.id, f"✅ Бот успешно подключен к группе: {event.chat.title}")
-        except: pass
+            await bot.send_message(user_id, f"✅ Я подключен к группе **{event.chat.title}**!\nТеперь можешь управлять мной отсюда.")
+        except:
+            pass # Если личка закрыта, ничего не поделаешь
 
 async def main():
     await asyncio.gather(start_background_web(), dp.start_polling(bot))
