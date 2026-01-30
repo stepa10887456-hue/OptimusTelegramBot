@@ -1,17 +1,16 @@
 import logging
 import asyncio
-import threading
 import os
-from aiohttp import web  # Нужно для мини-сервера
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-# Настройка логирования
+# Настройка логов
 logging.basicConfig(level=logging.INFO)
 
-# Твой НОВЫЙ токен
 API_TOKEN = '8509137282:AAFZZmmtw3laqW_HAyY8mlW-gjdapkxJk9M'
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
@@ -19,7 +18,11 @@ dp = Dispatcher()
 registered_users = set()
 spam_tasks = {}
 
-# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
+# Состояния для ожидания ввода от юзера
+class SpamStates(StatesGroup):
+    waiting_for_spam_data = State()
+
+# --- МИНИ-СЕРВЕР ---
 async def handle(request):
     return web.Response(text="Optimus is alive!")
 
@@ -28,7 +31,6 @@ async def start_background_web():
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render дает порт в переменной окружения PORT, по умолчанию 10000
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
@@ -38,7 +40,7 @@ def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/Optimusbylumox_bot?startgroup=true"))
     builder.row(types.InlineKeyboardButton(text="📝 Записать юзера", callback_data="register_me"))
-    builder.row(types.InlineKeyboardButton(text="🚀 Спам-функция", callback_data="spam_menu"))
+    builder.row(types.InlineKeyboardButton(text="🚀 Спам-функция", callback_data="spam_setup"))
     builder.row(types.InlineKeyboardButton(text="🔍 Изучить группу", callback_data="scan_group"))
     return builder.as_markup()
 
@@ -54,7 +56,8 @@ async def start_handler(message: types.Message):
     await message.answer("Привет! Я **Optimus**. Выбери действие:", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: types.CallbackQuery):
+async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear() # Сбрасываем ожидания, если юзер передумал
     await callback.message.edit_text("Главное меню Optimus:", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "register_me")
@@ -62,32 +65,47 @@ async def register_callback(callback: types.CallbackQuery):
     registered_users.add(callback.from_user.id)
     await callback.message.edit_text("✅ Ты успешно записан в базу!", reply_markup=get_back_button())
 
-# --- СПАМ ---
-@dp.message(Command("spam"))
-async def start_spam(message: types.Message):
-    args = message.text.split(maxsplit=2)
-    if len(args) < 3:
-        return await message.answer("Используй: `/spam [кол-во] [текст]`")
-    
-    count = int(args[1])
-    text = args[2]
-    chat_id = message.chat.id
-    
-    stop_btn = InlineKeyboardBuilder()
-    stop_btn.row(types.InlineKeyboardButton(text="🛑 ОСТАНОВИТЬ", callback_data=f"stop_spam_{chat_id}"))
-    
-    spam_tasks[chat_id] = True
-    await message.answer(f"🚀 Запускаю спам ({count} раз)...", reply_markup=stop_btn.as_markup())
+# --- НОВАЯ СПАМ-ФУНКЦИЯ (ЧЕРЕЗ КНОПКУ) ---
+@dp.callback_query(F.data == "spam_setup")
+async def spam_setup(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(SpamStates.waiting_for_spam_data)
+    await callback.message.edit_text(
+        "🚀 **Настройка спама**\n\nПришли сообщение в формате:\n`Количество | Текст`\n\nНапример:\n`5 | Всем привет!`",
+        reply_markup=get_back_button()
+    )
 
-    for i in range(count):
-        if chat_id not in spam_tasks: break
-        try:
-            await bot.send_message(chat_id, text)
-            await asyncio.sleep(0.6) 
-        except Exception:
-            await asyncio.sleep(2) # Если лимит — притормаживаем
+@dp.message(SpamStates.waiting_for_spam_data)
+async def process_spam_input(message: types.Message, state: FSMContext):
+    if '|' not in message.text:
+        return await message.answer("❌ Ошибка! Используй разделитель `|` (например: 10 | привет)")
     
-    if chat_id in spam_tasks: del spam_tasks[chat_id]
+    parts = message.text.split('|', 1)
+    try:
+        count = int(parts[0].strip())
+        text = parts[1].strip()
+        chat_id = message.chat.id
+        
+        await state.clear()
+        
+        stop_btn = InlineKeyboardBuilder()
+        stop_btn.row(types.InlineKeyboardButton(text="🛑 ОСТАНОВИТЬ", callback_data=f"stop_spam_{chat_id}"))
+        
+        spam_tasks[chat_id] = True
+        await message.answer(f"🚀 Запускаю спам ({count} раз)...", reply_markup=stop_btn.as_markup())
+
+        for i in range(count):
+            if chat_id not in spam_tasks: break
+            try:
+                await bot.send_message(chat_id, text)
+                await asyncio.sleep(0.7)
+            except Exception:
+                await asyncio.sleep(3)
+        
+        if chat_id in spam_tasks: del spam_tasks[chat_id]
+        await message.answer("✅ Спам завершен.")
+
+    except ValueError:
+        await message.answer("❌ Первое число должно быть количеством!")
 
 @dp.callback_query(F.data.startswith("stop_spam_"))
 async def stop_spam_handler(callback: types.CallbackQuery):
@@ -96,33 +114,48 @@ async def stop_spam_handler(callback: types.CallbackQuery):
         del spam_tasks[chat_id]
         await callback.message.edit_text("🛑 Спам остановлен.")
 
-# --- СКАНЕР ---
+# --- СКАНЕР (ОТПРАВКА В ЛС) ---
 @dp.callback_query(F.data == "scan_group")
 async def scan_menu(callback: types.CallbackQuery):
-    await callback.message.edit_text("Добавь меня в группу админом и напиши `/scan` прямо там.", reply_markup=get_back_button())
+    await callback.message.edit_text(
+        "Чтобы изучить группу, добавь меня туда админом и напиши команду `/scan` прямо в чате. Результат придет тебе в ЛС!", 
+        reply_markup=get_back_button()
+    )
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: types.Message):
     if message.chat.type == "private":
-        return await message.answer("Пиши эту команду в группе!")
+        return await message.answer("Эту команду нужно писать в группе!")
     
-    status_msg = await message.answer("🔍 Анализирую...")
+    user_id = message.from_user.id # Тот, кто вызвал скан
+    
     try:
         admins = await bot.get_chat_administrators(message.chat.id)
         chat = await bot.get_chat(message.chat.id)
         
-        report = f"📊 **Группа: {message.chat.title}**\n👤 Админов: {len(admins)}\n"
+        report = (
+            f"🔍 **Результат сканирования группы: {message.chat.title}**\n\n"
+            f"👤 Администраторов: {len(admins)}\n"
+        )
         
         vulnerabilities = []
-        if chat.permissions.can_invite_users: vulnerabilities.append("- Юзеры могут спамить инвайтами")
-        if chat.permissions.can_pin_messages: vulnerabilities.append("- Юзеры могут менять закрепы")
+        if chat.permissions.can_invite_users: vulnerabilities.append("— Обычные пользователи могут спамить инвайтами.")
+        if chat.permissions.can_pin_messages: vulnerabilities.append("— Обычные пользователи могут менять закрепы.")
         
-        report += "\n⚠️ **Уязвимости:**\n" + "\n".join(vulnerabilities) if vulnerabilities else "\n✅ Дыр в настройках нет."
-        await status_msg.edit_text(report)
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Нужны права админа!")
+        if vulnerabilities:
+            report += "⚠️ **Найдены уязвимости в настройках:**\n" + "\n".join(vulnerabilities)
+        else:
+            report += "✅ Группа настроена безопасно."
 
-# --- ДОБАВЛЕНИЕ В ГРУППУ ---
+        # Отправляем результат В ЛИЧКУ
+        await bot.send_message(user_id, report)
+        # А в группе просто подтверждаем выполнение
+        await message.answer("🔍 Анализ завершен. Результаты отправлены вам в личные сообщения.")
+        
+    except Exception as e:
+        await message.answer("❌ Ошибка! Скорее всего, вы не написали мне в личку (нажмите /start) или я не админ.")
+
+# --- ЛОГИКА ДОБАВЛЕНИЯ ---
 @dp.my_chat_member()
 async def on_bot_added(event: types.ChatMemberUpdated):
     if event.new_chat_member.status in ["member", "administrator"]:
@@ -133,11 +166,8 @@ async def on_bot_added(event: types.ChatMemberUpdated):
                 await bot.send_message(adder_id, f"✅ Подключен к: {event.chat.title}\n{invite_link}")
             except:
                 await bot.send_message(event.chat.id, "Дайте мне права админа для ссылки!")
-        else:
-            await bot.send_message(event.chat.id, "Ошибка! Сначала нажми 'Записать юзера' в личке бота.")
 
 async def main():
-    # Запускаем веб-сервер и бота одновременно
     await asyncio.gather(start_background_web(), dp.start_polling(bot))
 
 if __name__ == "__main__":
