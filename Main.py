@@ -1,20 +1,39 @@
 import logging
 import asyncio
+import threading
+import os
+from aiohttp import web  # Нужно для мини-сервера
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramBadRequest
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-API_TOKEN = '7408761842:AAHrCeJ5upJUQmCQGD0Dz6treBBnnNoByio'
+# Твой НОВЫЙ токен
+API_TOKEN = '8509137282:AAFZZmmtw3laqW_HAyY8mlW-gjdapkxJk9M'
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
 registered_users = set()
-spam_tasks = {} # Для хранения запущенных задач спама
+spam_tasks = {}
 
-# --- Клавиатуры ---
+# --- МИНИ-СЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Optimus is alive!")
+
+async def start_background_web():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render дает порт в переменной окружения PORT, по умолчанию 10000
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+
+# --- КЛАВИАТУРЫ ---
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(types.InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/Optimusbylumox_bot?startgroup=true"))
@@ -28,7 +47,7 @@ def get_back_button():
     builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main"))
     return builder.as_markup()
 
-# --- Обработчики ---
+# --- ОБРАБОТЧИКИ ---
 
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
@@ -43,13 +62,12 @@ async def register_callback(callback: types.CallbackQuery):
     registered_users.add(callback.from_user.id)
     await callback.message.edit_text("✅ Ты успешно записан в базу!", reply_markup=get_back_button())
 
-# --- ФУНКЦИЯ СПАМА ---
-# Инструкция: /spam [текст] [кол-во] в чате или личке
+# --- СПАМ ---
 @dp.message(Command("spam"))
 async def start_spam(message: types.Message):
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
-        return await message.answer("Используй: `/spam [кол-во] [текст]`\nПример: `/spam 10 Привет!`")
+        return await message.answer("Используй: `/spam [кол-во] [текст]`")
     
     count = int(args[1])
     text = args[2]
@@ -62,9 +80,12 @@ async def start_spam(message: types.Message):
     await message.answer(f"🚀 Запускаю спам ({count} раз)...", reply_markup=stop_btn.as_markup())
 
     for i in range(count):
-        if chat_id not in spam_tasks: break # Если нажали стоп
-        await bot.send_message(chat_id, text)
-        await asyncio.sleep(0.5) # Небольшая пауза, чтобы Telegram не забанил сразу
+        if chat_id not in spam_tasks: break
+        try:
+            await bot.send_message(chat_id, text)
+            await asyncio.sleep(0.6) 
+        except Exception:
+            await asyncio.sleep(2) # Если лимит — притормаживаем
     
     if chat_id in spam_tasks: del spam_tasks[chat_id]
 
@@ -73,52 +94,35 @@ async def stop_spam_handler(callback: types.CallbackQuery):
     chat_id = int(callback.data.split("_")[2])
     if chat_id in spam_tasks:
         del spam_tasks[chat_id]
-        await callback.answer("Остановка...")
         await callback.message.edit_text("🛑 Спам остановлен.")
-    else:
-        await callback.answer("Спам уже не идет.")
 
-# --- ИЗУЧЕНИЕ ГРУППЫ ---
+# --- СКАНЕР ---
 @dp.callback_query(F.data == "scan_group")
 async def scan_menu(callback: types.CallbackQuery):
-    await callback.message.edit_text("Чтобы изучить группу, добавь меня туда админом и напиши команду `/scan` прямо в чате группы.", reply_markup=get_back_button())
+    await callback.message.edit_text("Добавь меня в группу админом и напиши `/scan` прямо там.", reply_markup=get_back_button())
 
 @dp.message(Command("scan"))
 async def cmd_scan(message: types.Message):
     if message.chat.type == "private":
-        return await message.answer("Эту команду нужно писать в группе!")
+        return await message.answer("Пиши эту команду в группе!")
     
-    status_msg = await message.answer("🔍 Начинаю анализ группы...")
-    
+    status_msg = await message.answer("🔍 Анализирую...")
     try:
         admins = await bot.get_chat_administrators(message.chat.id)
-        # Внимание: получить ВСЕХ участников ботом нельзя (ограничение Telegram), 
-        # можно только проверить текущие права и список админов.
-        
-        report = (
-            f"📊 **Отчет по группе: {message.chat.title}**\n\n"
-            f"👤 Админов найдено: {len(admins)}\n"
-            f"🤖 Мои права: {'Админ' if any(a.user.id == bot.id for a in admins) else 'Участник'}\n"
-        )
-        
-        # Проверка уязвимостей
         chat = await bot.get_chat(message.chat.id)
+        
+        report = f"📊 **Группа: {message.chat.title}**\n👤 Админов: {len(admins)}\n"
+        
         vulnerabilities = []
-        if not chat.permissions.can_send_messages: vulnerabilities.append("- Чат полностью закрыт")
-        if chat.permissions.can_invite_users: vulnerabilities.append("- ⚠️ Обычные юзеры могут добавлять кого угодно")
-        if chat.permissions.can_pin_messages: vulnerabilities.append("- ⚠️ Обычные юзеры могут крепить сообщения")
+        if chat.permissions.can_invite_users: vulnerabilities.append("- Юзеры могут спамить инвайтами")
+        if chat.permissions.can_pin_messages: vulnerabilities.append("- Юзеры могут менять закрепы")
         
-        if not vulnerabilities:
-            report += "\n✅ Критических уязвимостей настроек не найдено."
-        else:
-            report += "\n⚠️ **Уязвимости:**\n" + "\n".join(vulnerabilities)
-
+        report += "\n⚠️ **Уязвимости:**\n" + "\n".join(vulnerabilities) if vulnerabilities else "\n✅ Дыр в настройках нет."
         await status_msg.edit_text(report)
-        
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка при сканировании: {e}\n(Сделайте меня админом!)")
+        await status_msg.edit_text(f"❌ Нужны права админа!")
 
-# --- ЛОГИКА ПРИ ДОБАВЛЕНИИ ---
+# --- ДОБАВЛЕНИЕ В ГРУППУ ---
 @dp.my_chat_member()
 async def on_bot_added(event: types.ChatMemberUpdated):
     if event.new_chat_member.status in ["member", "administrator"]:
@@ -126,14 +130,15 @@ async def on_bot_added(event: types.ChatMemberUpdated):
         if adder_id in registered_users:
             try:
                 invite_link = await bot.export_chat_invite_link(event.chat.id)
-                await bot.send_message(adder_id, f"✅ Подключен к: {event.chat.title}\nСсылка: {invite_link}")
+                await bot.send_message(adder_id, f"✅ Подключен к: {event.chat.title}\n{invite_link}")
             except:
-                await bot.send_message(event.chat.id, "Сделайте меня админом, чтобы я прислал ссылку!")
+                await bot.send_message(event.chat.id, "Дайте мне права админа для ссылки!")
         else:
-            await bot.send_message(event.chat.id, "Ошибка! Пользователь не записан в Optimus.")
+            await bot.send_message(event.chat.id, "Ошибка! Сначала нажми 'Записать юзера' в личке бота.")
 
 async def main():
-    await dp.start_polling(bot)
+    # Запускаем веб-сервер и бота одновременно
+    await asyncio.gather(start_background_web(), dp.start_polling(bot))
 
 if __name__ == "__main__":
     asyncio.run(main())
